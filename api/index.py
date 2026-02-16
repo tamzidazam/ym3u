@@ -72,3 +72,4 @@ async def get_stream_url(url: str = Query(..., description="YouTube Video URL"))
         "original_url": url,
         "stream_url": get_m3u8(url)
     }
+
