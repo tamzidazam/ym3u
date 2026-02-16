@@ -1,102 +1,55 @@
-import os
-import tempfile
-import yt_dlp
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
+import requests
 
 app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-def get_cookies_path():
-    cookie_content = os.environ.get("YOUTUBE_COOKIES")
-    if not cookie_content:
-        return None
-    tfile = tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.txt')
-    tfile.write(cookie_content)
-    tfile.close()
-    return tfile.name
-
-def extract_stream(url, client_type, cookie_path):
-    """
-    Tries to get a stream with a specific client disguise (ios, android, tv, etc.)
-    """
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'cookiefile': cookie_path,
-        'extractor_args': {
-            'youtube': {
-                'player_client': [client_type]
-            }
-        },
-    }
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            
-            # 1. Prioritize HLS (m3u8)
-            if 'formats' in info:
-                for f in info['formats']:
-                    if f.get('protocol') == 'm3u8_native':
-                        return f['url'], "m3u8"
-            
-            # 2. Check strict extensions
-            if 'formats' in info:
-                for f in info['formats']:
-                    if f.get('url', '').endswith('.m3u8'):
-                        return f['url'], "m3u8"
-            
-            # 3. If no m3u8, return DASH (mpd) as fallback
-            # (Better to have a working video than nothing)
-            if 'formats' in info:
-                for f in info['formats']:
-                    if f.get('protocol') == 'https' and f.get('ext') == 'mp4':
-                        return f['url'], "mp4"
-
-            raise ValueError("No formats found")
-            
-    except Exception as e:
-        return None, str(e)
+# List of public instances (we try a few in case one is down)
+INSTANCES = [
+    "https://yewtu.be",
+    "inv.nadeko.net",
+    "https://invidious.jing.rocks",
+    "https://invidious.nerdvpn.de"
+]
 
 @app.get("/api/stream")
 @app.get("/stream")
-async def get_stream_url(url: str = Query(..., description="YouTube Video URL")):
-    cookie_path = get_cookies_path()
-    
-    # === STRATEGY: TRY 3 DIFFERENT DISGUISES ===
-    
-    # Attempt 1: iOS (Best for m3u8, but often blocked on servers)
-    stream_url, format_type = extract_stream(url, 'ios', cookie_path)
-    if stream_url:
-        if cookie_path: os.unlink(cookie_path)
-        return {"stream_url": stream_url, "format": format_type, "client_used": "ios"}
-        
-    # Attempt 2: Android TV (Good for m3u8, often less blocked)
-    stream_url, format_type = extract_stream(url, 'tv', cookie_path)
-    if stream_url:
-        if cookie_path: os.unlink(cookie_path)
-        return {"stream_url": stream_url, "format": format_type, "client_used": "tv"}
+def get_stream(url: str = Query(..., description="YouTube Video URL")):
+    # Extract Video ID (e.g., dQw4w9WgXcQ)
+    if "v=" in url:
+        video_id = url.split("v=")[1].split("&")[0]
+    elif "youtu.be/" in url:
+        video_id = url.split("youtu.be/")[1].split("?")[0]
+    else:
+        raise HTTPException(status_code=400, detail="Invalid YouTube URL")
 
-    # Attempt 3: Android (Very reliable, but usually returns DASH/mp4, not m3u8)
-    stream_url, format_type = extract_stream(url, 'android', cookie_path)
-    if stream_url:
-        if cookie_path: os.unlink(cookie_path)
-        return {
-            "stream_url": stream_url, 
-            "format": format_type, 
-            "client_used": "android",
-            "warning": "m3u8 unavailable, returned fallback format"
-        }
+    # Try each instance until one works
+    for instance in INSTANCES:
+        try:
+            api_url = f"{instance}/api/v1/videos/{video_id}"
+            response = requests.get(api_url, timeout=5)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Invidious returns 'formatStreams' (mp4) and 'hlsUrl' (m3u8)
+                # We prioritize HLS (m3u8)
+                if 'hlsUrl' in data:
+                    return {
+                        "stream_url": f"{instance}{data['hlsUrl']}",
+                        "source": "invidious-hls",
+                        "instance": instance
+                    }
+                
+                # Fallback to standard MP4 streams if HLS is missing
+                if 'formatStreams' in data:
+                    # Get the highest quality video
+                    best_stream = data['formatStreams'][-1]['url'] 
+                    return {
+                        "stream_url": best_stream,
+                        "source": "invidious-mp4",
+                        "instance": instance
+                    }
+        except:
+            continue
 
-    # Cleanup
-    if cookie_path and os.path.exists(cookie_path):
-        os.unlink(cookie_path)
-
-    raise HTTPException(status_code=500, detail="Failed to bypass YouTube server blocks. Try adding Cookies or a Proxy.")
+    raise HTTPException(status_code=503, detail="All Invidious instances failed. YouTube is tough today.")
