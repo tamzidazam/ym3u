@@ -1,75 +1,102 @@
 import os
 import tempfile
-from fastapi import FastAPI, HTTPException, Query
 import yt_dlp
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 def get_cookies_path():
-    """
-    Writes the cookies from the env var to a temporary file 
-    and returns the path.
-    """
     cookie_content = os.environ.get("YOUTUBE_COOKIES")
     if not cookie_content:
         return None
-    
-    # Create a temporary file that closes automatically only when we want
-    # Note: On Unix (Vercel/Render), we can read an open file, but safest is to close it first.
     tfile = tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.txt')
     tfile.write(cookie_content)
     tfile.close()
     return tfile.name
 
-def get_m3u8(video_url: str):
-    cookie_path = get_cookies_path()
-    
+def extract_stream(url, client_type, cookie_path):
+    """
+    Tries to get a stream with a specific client disguise (ios, android, tv, etc.)
+    """
     ydl_opts = {
-        'format': 'best',
         'quiet': True,
         'no_warnings': True,
-        # 1. Use the temp cookie file
-        'cookiefile': cookie_path, 
-        # 2. Spoof a common user agent to look less like a bot
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        # 3. Use the Android client which is often more lenient
+        'cookiefile': cookie_path,
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'web']
+                'player_client': [client_type]
             }
-        }
+        },
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_url, download=False)
+            info = ydl.extract_info(url, download=False)
             
-            # Clean up the temp cookie file
-            if cookie_path and os.path.exists(cookie_path):
-                os.unlink(cookie_path)
-
+            # 1. Prioritize HLS (m3u8)
             if 'formats' in info:
                 for f in info['formats']:
                     if f.get('protocol') == 'm3u8_native':
-                        return f['url']
-                    if f.get('url', '').endswith('.m3u8'):
-                        return f['url']
+                        return f['url'], "m3u8"
             
-            if 'url' in info and info['url'].endswith('.m3u8'):
-                return info['url']
-                
-            raise ValueError("No m3u8 stream found.")
+            # 2. Check strict extensions
+            if 'formats' in info:
+                for f in info['formats']:
+                    if f.get('url', '').endswith('.m3u8'):
+                        return f['url'], "m3u8"
+            
+            # 3. If no m3u8, return DASH (mpd) as fallback
+            # (Better to have a working video than nothing)
+            if 'formats' in info:
+                for f in info['formats']:
+                    if f.get('protocol') == 'https' and f.get('ext') == 'mp4':
+                        return f['url'], "mp4"
 
+            raise ValueError("No formats found")
+            
     except Exception as e:
-        # Clean up in case of error
-        if cookie_path and os.path.exists(cookie_path):
-            os.unlink(cookie_path)
-        raise HTTPException(status_code=500, detail=str(e))
+        return None, str(e)
 
 @app.get("/api/stream")
+@app.get("/stream")
 async def get_stream_url(url: str = Query(..., description="YouTube Video URL")):
-    return {
-        "original_url": url,
-        "stream_url": get_m3u8(url)
-    }
+    cookie_path = get_cookies_path()
+    
+    # === STRATEGY: TRY 3 DIFFERENT DISGUISES ===
+    
+    # Attempt 1: iOS (Best for m3u8, but often blocked on servers)
+    stream_url, format_type = extract_stream(url, 'ios', cookie_path)
+    if stream_url:
+        if cookie_path: os.unlink(cookie_path)
+        return {"stream_url": stream_url, "format": format_type, "client_used": "ios"}
+        
+    # Attempt 2: Android TV (Good for m3u8, often less blocked)
+    stream_url, format_type = extract_stream(url, 'tv', cookie_path)
+    if stream_url:
+        if cookie_path: os.unlink(cookie_path)
+        return {"stream_url": stream_url, "format": format_type, "client_used": "tv"}
 
+    # Attempt 3: Android (Very reliable, but usually returns DASH/mp4, not m3u8)
+    stream_url, format_type = extract_stream(url, 'android', cookie_path)
+    if stream_url:
+        if cookie_path: os.unlink(cookie_path)
+        return {
+            "stream_url": stream_url, 
+            "format": format_type, 
+            "client_used": "android",
+            "warning": "m3u8 unavailable, returned fallback format"
+        }
+
+    # Cleanup
+    if cookie_path and os.path.exists(cookie_path):
+        os.unlink(cookie_path)
+
+    raise HTTPException(status_code=500, detail="Failed to bypass YouTube server blocks. Try adding Cookies or a Proxy.")
