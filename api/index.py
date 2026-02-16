@@ -6,8 +6,8 @@ app = FastAPI()
 # List of public instances (we try a few in case one is down)
 INSTANCES = [
     "https://yewtu.be",
-    "inv.nadeko.net",
-    "https://invidious.jing.rocks",
+    "https://inv.nadeko.net",
+    "https://invidious.nerdvpn.de",
     "https://invidious.nerdvpn.de"
 ]
 
