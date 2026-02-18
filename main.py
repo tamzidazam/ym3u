@@ -1,25 +1,28 @@
 """
-YT-M3U8 API v4
-- Uses yt-dlp for ALL YouTube fetching (handles IP-locked signed URLs correctly)
-- Builds a synthetic master M3U8 from the format list instead of proxying Google's manifests
-- Proxies individual HLS sub-playlists and segments through our server
-- Works for both live streams and VOD
+YT-M3U8 API v5
+
+KEY INSIGHT: Google's segment URLs are session-signed — they only work during the 
+yt-dlp extraction session. You cannot embed them in a playlist for later fetching.
+
+SOLUTION: 
+- /api/subplaylist fetches the live HLS manifest fresh via yt-dlp, then rewrites
+  ALL segment URLs to point to /api/seg?video_url=...&sq=SEQUENCE_NUMBER
+- /api/seg re-extracts the video info fresh each time, finds the segment by sequence
+  number, and downloads it right then — within the same yt-dlp session
+- This way segment URLs never expire because we never store them; we always fetch fresh
 """
 import os
 import re
 import asyncio
-import subprocess
-import tempfile
-import httpx
 from pathlib import Path
-from urllib.parse import urljoin, urlparse, quote, unquote
+from urllib.parse import urljoin, urlparse, quote, unquote, parse_qs
 from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File
-from fastapi.responses import PlainTextResponse, HTMLResponse, StreamingResponse, Response
+from fastapi.responses import PlainTextResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
 
-app = FastAPI(title="YT-M3U8 API", description="YouTube → proxied HLS streams", version="4.0.0")
+app = FastAPI(title="YT-M3U8 API", description="YouTube → HLS streams", version="5.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 API_KEY = os.environ.get("API_KEY", "")
@@ -37,6 +40,7 @@ YT_HEADERS = {
     "Origin": "https://www.youtube.com",
     "Referer": "https://www.youtube.com/",
 }
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -77,84 +81,151 @@ def extract_info(url: str, fmt="best"):
 def friendly_error(e: Exception) -> str:
     msg = str(e)
     if "Sign in to confirm" in msg or "bot" in msg.lower():
-        return "YouTube bot-detection triggered. Upload cookies via POST /api/cookies (see /docs)."
+        return "YouTube bot-detection. Upload cookies via POST /api/cookies."
     if "age" in msg.lower():
         return "Age-restricted — upload YouTube cookies via POST /api/cookies."
     if "Private" in msg:
-        return "Private video — needs cookies from an account with access."
+        return "Private video."
     if "members" in msg.lower():
-        return "Members-only — needs cookies from a member account."
+        return "Members-only video."
     return msg
 
 
-def proxy_url(base_request: Request, target_url: str) -> str:
+def seg_proxy_url(base_request: Request, video_url: str, format_id: str, sq: str) -> str:
+    """Build a URL for /api/seg that fetches a segment by sequence number."""
     base = str(base_request.base_url).rstrip("/")
-    return f"{base}/proxy?url={quote(target_url, safe='')}"
+    return (
+        f"{base}/api/seg"
+        f"?video_url={quote(video_url, safe='')}"
+        f"&format_id={quote(format_id, safe='')}"
+        f"&sq={sq}"
+    )
 
 
-def rewrite_m3u8(content: str, base_url: str, request: Request) -> str:
-    """Rewrite all URLs in an M3U8 to go through our /proxy endpoint."""
+def rewrite_subplaylist(content: str, video_url: str, format_id: str, request: Request) -> str:
+    """
+    Rewrite an HLS sub-playlist so segment URLs become /api/seg?...&sq=N calls.
+    The sequence number (sq=N) is extracted from each segment URL.
+    This way segments are always fetched fresh — no stored session-bound URLs.
+    """
     lines = content.splitlines()
     out = []
     for line in lines:
         stripped = line.strip()
-        if not stripped:
+        if not stripped or stripped.startswith("#"):
             out.append(line)
             continue
 
-        # Rewrite URI="..." attributes in tags
-        def replace_uri(m):
-            uri = m.group(1)
-            abs_url = urljoin(base_url, uri)
-            return f'URI="{proxy_url(request, abs_url)}"'
-
-        rewritten = re.sub(r'URI="([^"]+)"', replace_uri, line)
-
-        # Rewrite bare segment/playlist URLs (lines not starting with #)
-        if not stripped.startswith("#"):
-            abs_url = urljoin(base_url, stripped)
-            rewritten = proxy_url(request, abs_url)
-
-        out.append(rewritten)
+        # Extract sequence number from segment URL: /sq/NNNN/
+        sq_match = re.search(r"/sq/(\d+)/", stripped)
+        if sq_match:
+            sq = sq_match.group(1)
+            out.append(seg_proxy_url(request, video_url, format_id, sq))
+        else:
+            # No sq number — keep URL as-is (shouldn't happen for live streams)
+            out.append(line)
     return "\n".join(out)
 
 
-def fetch_m3u8_via_ytdlp(manifest_url: str) -> str:
+def fetch_manifest_for_format(video_url: str, format_id: str) -> tuple[str, str]:
     """
-    Fetch an HLS manifest using yt-dlp's internal downloader so it handles
-    all the auth headers and signed URL quirks correctly.
+    Extract fresh info and return (manifest_content, manifest_url) for a specific format.
+    Uses yt-dlp to both get the manifest URL and fetch its content.
     """
-    opts = {
-        **get_ydl_opts(),
-        "skip_download": True,
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        # Use yt-dlp's urllib opener which has all the right headers/cookies
-        opener = ydl.urlopen(manifest_url)
-        return opener.read().decode("utf-8")
+    with yt_dlp.YoutubeDL(get_ydl_opts(format_id)) as ydl:
+        info = ydl.extract_info(video_url, download=False)
+        formats = info.get("formats", [])
+
+        # Find matching format
+        matched = [f for f in formats if f.get("format_id") == format_id and f.get("url")]
+        if not matched:
+            matched = [f for f in formats if f.get("vcodec") not in ("none", None) and f.get("url")]
+            if not matched:
+                raise ValueError("No matching format found")
+            matched.sort(key=lambda x: x.get("height", 0) or 0, reverse=True)
+
+        chosen = matched[0]
+        manifest_url = chosen["url"]
+        protocol = chosen.get("protocol", "")
+
+        # If it's an HLS format, fetch the manifest content
+        if protocol in ("m3u8", "m3u8_native"):
+            resp = ydl.urlopen(manifest_url)
+            content = resp.read().decode("utf-8")
+            return content, manifest_url
+
+        # VOD: build a simple playlist from the direct URL
+        dur = info.get("duration", 0) or 0
+        title = info.get("title", "video")
+        playlist = (
+            "#EXTM3U\n#EXT-X-VERSION:3\n"
+            f"#EXT-X-TARGETDURATION:{int(dur)+1}\n"
+            "#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n"
+            f"#EXTINF:{dur:.3f},{title}\n"
+            f"{manifest_url}\n"
+            "#EXT-X-ENDLIST\n"
+        )
+        return playlist, manifest_url
 
 
-def build_master_m3u8_from_formats(info: dict, request: Request) -> str:
+def fetch_segment_by_sq(video_url: str, format_id: str, sq: int) -> bytes:
     """
-    Build a synthetic HLS master playlist from yt-dlp format list.
-    Each quality level points to /api/subplaylist which serves that format's stream.
-    This avoids needing to proxy Google's IP-locked manifest URLs at all.
+    Re-extract fresh URLs and fetch segment by sequence number within a SINGLE yt-dlp session.
+    This avoids session expiry by doing extraction and download atomically.
     """
+    with yt_dlp.YoutubeDL(get_ydl_opts(format_id)) as ydl:
+        info = ydl.extract_info(video_url, download=False)
+        formats = info.get("formats", [])
+
+        matched = [f for f in formats if f.get("format_id") == format_id and f.get("url")]
+        if not matched:
+            matched = [f for f in formats if f.get("vcodec") not in ("none", None) and f.get("url")]
+            if not matched:
+                raise ValueError("No matching format found")
+            matched.sort(key=lambda x: x.get("height", 0) or 0, reverse=True)
+
+        chosen = matched[0]
+        manifest_url = chosen["url"]
+
+        if chosen.get("protocol") not in ("m3u8", "m3u8_native"):
+            # VOD — just download the whole stream URL
+            resp = ydl.urlopen(manifest_url)
+            return resp.read()
+
+        # Fetch the manifest to find the correct segment URL for this sq number
+        resp = ydl.urlopen(manifest_url)
+        manifest = resp.read().decode("utf-8")
+
+        # Find segment URL with matching sq number
+        seg_url = None
+        for line in manifest.splitlines():
+            if f"/sq/{sq}/" in line and not line.startswith("#"):
+                seg_url = urljoin(manifest_url, line.strip()) if not line.startswith("http") else line.strip()
+                break
+
+        if not seg_url:
+            # Try building it from the manifest URL pattern
+            # Manifest URL: .../playlist/index.m3u8/sq/PREV/... -> replace sq number
+            seg_url = re.sub(r"/sq/\d+/", f"/sq/{sq}/", manifest_url)
+            # Remove /playlist/index.m3u8 prefix parts if present
+            if "/playlist/index.m3u8" in seg_url:
+                seg_url = re.sub(r"/playlist/index\.m3u8/sq/\d+/(.*)", f"/sq/{sq}/\\1", seg_url)
+
+        # Fetch the segment within the same session
+        seg_resp = ydl.urlopen(seg_url)
+        return seg_resp.read()
+
+
+def build_master_m3u8(info: dict, request: Request) -> str:
+    """Build a synthetic HLS master playlist from yt-dlp format list."""
     formats = info.get("formats", [])
-    video_id = info.get("id", "")
-
-    # Separate formats with video
     video_formats = [
         f for f in formats
-        if f.get("vcodec") not in ("none", None)
-        and f.get("height")
-        and f.get("url")
+        if f.get("vcodec") not in ("none", None) and f.get("height") and f.get("url")
     ]
-
     if not video_formats:
         raise HTTPException(404, "No playable video formats found")
 
-    # Deduplicate by height, pick highest tbr for each height
     by_height: dict = {}
     for f in video_formats:
         h = f["height"]
@@ -162,128 +233,61 @@ def build_master_m3u8_from_formats(info: dict, request: Request) -> str:
             by_height[h] = f
 
     sorted_formats = sorted(by_height.values(), key=lambda x: x["height"], reverse=True)
-
     base = str(request.base_url).rstrip("/")
+    video_url = info.get("webpage_url", "")
 
     master = "#EXTM3U\n#EXT-X-VERSION:3\n\n"
-    for f in sorted_formats[:8]:  # cap at 8 quality levels
+    for f in sorted_formats[:8]:
         h = f["height"]
         w = f.get("width") or int(h * 16 / 9)
         bw = int((f.get("tbr") or 1000) * 1000)
         fps = f.get("fps") or 30
         fmt_id = f.get("format_id", "")
 
-        # Sub-playlist URL for this specific format
         sub_url = (
             f"{base}/api/subplaylist"
-            f"?video_url={quote(info.get('webpage_url', ''), safe='')}"
+            f"?video_url={quote(video_url, safe='')}"
             f"&format_id={quote(fmt_id, safe='')}"
         )
-
         master += f'#EXT-X-STREAM-INF:BANDWIDTH={bw},RESOLUTION={w}x{h},FRAME-RATE={fps},NAME="{h}p"\n'
         master += f"{sub_url}\n"
 
     return master
 
 
-def build_single_m3u8(stream_url: str, duration: float, title: str, request: Request) -> str:
-    """Build a single-segment VOD M3U8 with a proxied stream URL."""
-    proxied = proxy_url(request, stream_url)
-    return (
-        "#EXTM3U\n#EXT-X-VERSION:3\n"
-        f"#EXT-X-TARGETDURATION:{int(duration)+1}\n"
-        "#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n"
-        f"#EXTINF:{duration:.3f},{title}\n"
-        f"{proxied}\n"
-        "#EXT-X-ENDLIST\n"
-    )
+# ── Segment endpoint — the key piece ─────────────────────────────────────────
 
-
-# ── Proxy endpoint ────────────────────────────────────────────────────────────
-
-ALLOWED_PROXY_HOSTS = (
-    "googlevideo.com",
-    "manifest.googlevideo.com",
-    "rr1---sn", "rr2---sn", "rr3---sn", "rr4---sn", "rr5---sn",
-    "googleusercontent.com",
-    "youtube.com",
-    "ytimg.com",
-)
-
-
-@app.get("/proxy", include_in_schema=False)
-async def proxy_endpoint(request: Request, url: str = Query(...)):
-    """Reverse-proxy HLS segments and manifests with correct YouTube headers."""
-    target = unquote(url)
-    host = urlparse(target).netloc
-
-    if not any(allowed in host for allowed in ALLOWED_PROXY_HOSTS):
-        raise HTTPException(403, f"Proxy not allowed for: {host}")
-
-    # Detect if this is an M3U8 (manifest/playlist)
-    # CRITICAL: seg.ts URLs contain "index.m3u8" mid-path, e.g.:
-    #   /videoplayback/.../playlist/index.m3u8/sq/6781535/.../seg.ts  <- TS segment!
-    # So we must check the FINAL path component, not substring match.
-    parsed_target = urlparse(target)
-    path_lower = parsed_target.path.lower()
-    # "/sq/" in path = numbered segment chunk, never a manifest
-    is_segment = "/sq/" in path_lower or path_lower.endswith(".ts") or path_lower.endswith(".aac") or path_lower.endswith(".m4s")
-    is_m3u8 = not is_segment and (
-        path_lower.endswith(".m3u8")
-        or (path_lower.endswith("index.m3u8"))
-        or ("/hls_playlist/" in path_lower and not is_segment)
-        or ("/hls_manifest/" in path_lower and not is_segment)
-    )
-
-    if is_m3u8:
-        # Fetch via yt-dlp's opener (handles auth correctly)
-        try:
-            loop = asyncio.get_event_loop()
-            content = await loop.run_in_executor(None, fetch_m3u8_via_ytdlp, target)
-        except Exception as e:
-            raise HTTPException(502, f"Failed to fetch manifest: {e}")
-        rewritten = rewrite_m3u8(content, target, request)
-        return PlainTextResponse(
-            rewritten,
-            media_type="application/vnd.apple.mpegurl",
-            headers={"Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*"},
-        )
-
-    # Binary segment — fetch via yt-dlp opener (handles IP-signed URLs correctly)
-    # httpx gets 403 because Google segments are IP+session signed; yt-dlp sends the right tokens
-    path_end = path_lower.split("?")[0]
-    if path_end.endswith(".ts") or "/seg.ts" in path_lower or "/sq/" in path_lower:
-        ct = "video/mp2t"
-    elif path_end.endswith(".m4s") or path_end.endswith(".mp4"):
-        ct = "video/mp4"
-    elif path_end.endswith(".aac"):
-        ct = "audio/aac"
-    else:
-        ct = "application/octet-stream"
-
-    def fetch_segment_bytes(url: str) -> bytes:
-        """Fetch a segment synchronously via yt-dlp urlopen (handles IP-signed auth)."""
-        with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
-            resp = ydl.urlopen(url)
-            return resp.read()
-
-    # Run synchronously in thread pool, then return as plain Response (not streaming).
-    # StreamingResponse + async generator + run_in_executor causes empty body — the
-    # generator exits before the executor resolves. Plain Response with bytes is reliable.
+@app.get("/api/seg", include_in_schema=False)
+async def get_segment(
+    request: Request,
+    video_url: str = Query(...),
+    format_id: str = Query(...),
+    sq: int = Query(...),
+):
+    """
+    Fetch a specific HLS segment by sequence number.
+    Re-extracts fresh YouTube URLs each time — avoids session expiry completely.
+    """
     loop = asyncio.get_event_loop()
     try:
-        data = await loop.run_in_executor(None, fetch_segment_bytes, target)
+        data = await loop.run_in_executor(
+            None,
+            fetch_segment_by_sq,
+            unquote(video_url),
+            format_id,
+            sq,
+        )
     except Exception as e:
         raise HTTPException(502, f"Segment fetch failed: {e}")
 
     return Response(
         content=data,
-        media_type=ct,
+        media_type="video/mp2t",
         headers={"Cache-Control": "public, max-age=300", "Access-Control-Allow-Origin": "*"},
     )
 
 
-# ── Sub-playlist endpoint (per-quality HLS playlist) ─────────────────────────
+# ── Sub-playlist endpoint ─────────────────────────────────────────────────────
 
 @app.get("/api/subplaylist", response_class=PlainTextResponse, include_in_schema=False)
 async def subplaylist(
@@ -292,49 +296,26 @@ async def subplaylist(
     format_id: str = Query(...),
 ):
     """
-    Returns a per-quality HLS sub-playlist for use in a master playlist.
-    Re-extracts the stream URL fresh (handles expiry).
+    Fetches fresh HLS manifest and rewrites segment URLs to /api/seg calls.
+    Called by the player for each quality level in the master playlist.
     """
+    loop = asyncio.get_event_loop()
     try:
-        opts = {**get_ydl_opts(format_id), "format": format_id}
-        loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(
+        content, manifest_url = await loop.run_in_executor(
             None,
-            lambda: extract_info(unquote(video_url), format_id)
+            fetch_manifest_for_format,
+            unquote(video_url),
+            format_id,
         )
     except Exception as e:
         raise HTTPException(400, str(e))
 
-    formats = info.get("formats", [])
-    matched = [f for f in formats if f.get("format_id") == format_id and f.get("url")]
-    if not matched:
-        # Fall back to best
-        matched = [f for f in formats if f.get("vcodec") not in ("none", None) and f.get("url")]
-        if not matched:
-            raise HTTPException(404, "Format not found")
-        matched.sort(key=lambda x: x.get("height", 0) or 0, reverse=True)
-
-    chosen = matched[0]
-    stream_url = chosen["url"]
-    is_live = info.get("is_live") or info.get("live_status") == "is_live"
-
-    # If this format has its own HLS manifest, proxy that
-    if chosen.get("protocol") in ("m3u8", "m3u8_native") and chosen.get("url"):
-        try:
-            loop = asyncio.get_event_loop()
-            content = await loop.run_in_executor(None, fetch_m3u8_via_ytdlp, stream_url)
-            rewritten = rewrite_m3u8(content, stream_url, request)
-            return PlainTextResponse(rewritten, media_type="application/vnd.apple.mpegurl",
-                                     headers={"Cache-Control": "no-cache"})
-        except Exception:
-            pass
-
-    # VOD: build single-segment playlist
-    dur = info.get("duration", 0) or 0
-    title = info.get("title", "video")
-    playlist = build_single_m3u8(stream_url, dur, title, request)
-    return PlainTextResponse(playlist, media_type="application/vnd.apple.mpegurl",
-                             headers={"Cache-Control": "no-cache"})
+    rewritten = rewrite_subplaylist(content, unquote(video_url), format_id, request)
+    return PlainTextResponse(
+        rewritten,
+        media_type="application/vnd.apple.mpegurl",
+        headers={"Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*"},
+    )
 
 
 # ── Cookie management ─────────────────────────────────────────────────────────
@@ -376,7 +357,7 @@ async def delete_cookies(request: Request):
     if p:
         os.remove(p)
         return {"status": "ok", "message": "Cookies deleted"}
-    return {"status": "ok", "message": "No cookies were loaded"}
+    return {"status": "ok", "message": "No cookies loaded"}
 
 
 # ── Core API ──────────────────────────────────────────────────────────────────
@@ -384,26 +365,25 @@ async def delete_cookies(request: Request):
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def root():
     p = Path("static/index.html")
-    return p.read_text() if p.exists() else "<h1>YT-M3U8 API v4</h1><a href='/docs'>Docs</a>"
+    return p.read_text() if p.exists() else "<h1>YT-M3U8 API v5</h1><a href='/docs'>Docs</a>"
 
 
 @app.get("/api/m3u8", response_class=PlainTextResponse,
          summary="Get M3U8 master playlist", tags=["Core"])
 async def get_m3u8(
     request: Request,
-    url: str = Query(..., description="YouTube video URL", example="https://youtube.com/watch?v=dQw4w9WgXcQ"),
-    quality: str = Query("best", description="best | worst | 1080 | 720 | 480 | 360 | 'master' for all qualities"),
+    url: str = Query(..., description="YouTube video URL"),
+    quality: str = Query("best", description="best | worst | 1080 | 720 | 480 | 360 | master"),
 ):
     """
-    Returns a proxied M3U8 playlist.
-    - Use quality=master to get a master playlist with all quality levels.
-    - All traffic is proxied through this server (CORS + referrer safe).
-    - Works in browsers, VLC, mpv, ffmpeg, HLS.js.
+    Returns a proxied M3U8 master playlist.
+    All segment fetching goes through /api/seg which re-extracts fresh URLs on every request.
+    Works in VLC, mpv, ffmpeg. Browsers need HLS.js.
     """
     check_key(request)
     try:
         loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(None, lambda: extract_info(url))
+        info = await loop.run_in_executor(None, extract_info, url)
     except yt_dlp.utils.DownloadError as e:
         raise HTTPException(400, friendly_error(e))
     except Exception as e:
@@ -412,15 +392,11 @@ async def get_m3u8(
     is_live = info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming")
 
     if quality == "master" or is_live:
-        # Build a synthetic master playlist — each quality hits /api/subplaylist
-        master = build_master_m3u8_from_formats(info, request)
-        return PlainTextResponse(
-            master,
-            media_type="application/vnd.apple.mpegurl",
-            headers={"Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*"},
-        )
+        master = build_master_m3u8(info, request)
+        return PlainTextResponse(master, media_type="application/vnd.apple.mpegurl",
+                                 headers={"Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*"})
 
-    # Single quality: find the best matching format
+    # Single quality
     formats = info.get("formats", [])
     vf = [f for f in formats if f.get("vcodec") not in ("none", None) and f.get("url")]
     if not vf:
@@ -438,37 +414,26 @@ async def get_m3u8(
             vf.sort(key=lambda x: x.get("height", 0) or 0, reverse=True)
 
     chosen = vf[0]
+    base = str(request.base_url).rstrip("/")
+    fmt_id = chosen.get("format_id", "")
+    video_url = info.get("webpage_url", url)
 
-    # If this format is already an HLS stream, route through subplaylist
-    if chosen.get("protocol") in ("m3u8", "m3u8_native"):
-        base = str(request.base_url).rstrip("/")
-        sub_url = (
-            f"{base}/api/subplaylist"
-            f"?video_url={quote(url, safe='')}"
-            f"&format_id={quote(chosen.get('format_id', ''), safe='')}"
-        )
-        # Return a single-entry master pointing to subplaylist
-        h = chosen.get("height", 0) or 0
-        w = chosen.get("width") or int(h * 16/9)
-        bw = int((chosen.get("tbr") or 1000) * 1000)
-        master = (
-            "#EXTM3U\n#EXT-X-VERSION:3\n"
-            f'#EXT-X-STREAM-INF:BANDWIDTH={bw},RESOLUTION={w}x{h}\n'
-            f"{sub_url}\n"
-        )
-        return PlainTextResponse(master, media_type="application/vnd.apple.mpegurl",
-                                 headers={"Cache-Control": "no-cache"})
-
-    # VOD MP4: single-segment proxied playlist
-    dur = info.get("duration", 0) or 0
-    title = info.get("title", "video")
-    playlist = build_single_m3u8(chosen["url"], dur, title, request)
-    return PlainTextResponse(
-        playlist,
-        media_type="application/vnd.apple.mpegurl",
-        headers={"Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*",
-                 "Content-Disposition": 'inline; filename="playlist.m3u8"'},
+    # Return a single-entry master pointing to subplaylist
+    h = chosen.get("height", 0) or 0
+    w = chosen.get("width") or int(h * 16 / 9)
+    bw = int((chosen.get("tbr") or 1000) * 1000)
+    sub_url = (
+        f"{base}/api/subplaylist"
+        f"?video_url={quote(video_url, safe='')}"
+        f"&format_id={quote(fmt_id, safe='')}"
     )
+    master = (
+        "#EXTM3U\n#EXT-X-VERSION:3\n"
+        f'#EXT-X-STREAM-INF:BANDWIDTH={bw},RESOLUTION={w}x{h}\n'
+        f"{sub_url}\n"
+    )
+    return PlainTextResponse(master, media_type="application/vnd.apple.mpegurl",
+                             headers={"Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*"})
 
 
 @app.get("/api/formats", summary="List formats", tags=["Info"])
@@ -499,12 +464,12 @@ async def get_formats(request: Request, url: str = Query(...)):
         "uploader": info.get("uploader"),
         "thumbnail": info.get("thumbnail"),
         "master_m3u8_url": f"{request.base_url}api/m3u8?url={quote(url, safe='')}&quality=master",
-        "available_qualities": formats,
     }
 
 
-@app.get("/api/stream-url", summary="Raw stream URL (no proxy)", tags=["Core"])
+@app.get("/api/stream-url", summary="Raw stream URL", tags=["Core"])
 async def get_stream_url(request: Request, url: str = Query(...), quality: str = Query("best")):
+    """Direct signed URL — expires ~6h. Use /api/m3u8 for stable streams."""
     check_key(request)
     try:
         info = extract_info(url)
