@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: yt-m3u8-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: API_KEY
+        value: ""  # Set this to a secret string to require auth, or leave empty for open access
+      - key: COOKIES_FILE
+        value: /app/cookies.txt  # Upload your cookies.txt here if needed
+    disk:
+      name: cookies
+      mountPath: /app
+      sizeGB: 1

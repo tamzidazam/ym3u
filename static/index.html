@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>YT → M3U8</title>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;700;800&display=swap" rel="stylesheet"/>
+  <style>
+    :root {
+      --bg: #0a0a0a;
+      --surface: #111;
+      --border: #222;
+      --accent: #ff2d55;
+      --accent2: #ff9f0a;
+      --text: #f0f0f0;
+      --muted: #666;
+      --code-bg: #0d0d0d;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Syne', sans-serif;
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* Noise overlay */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.04'/%3E%3C/svg%3E");
+      pointer-events: none;
+      z-index: 1000;
+    }
+
+    header {
+      border-bottom: 1px solid var(--border);
+      padding: 1.5rem 2rem;
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+
+    .logo {
+      font-size: 1.4rem;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+    }
+
+    .logo span { color: var(--accent); }
+
+    .badge {
+      background: var(--accent);
+      color: #fff;
+      font-family: 'Space Mono', monospace;
+      font-size: 0.65rem;
+      padding: 0.2rem 0.5rem;
+      border-radius: 2px;
+      letter-spacing: 0.05em;
+    }
+
+    .nav-links {
+      margin-left: auto;
+      display: flex;
+      gap: 1.5rem;
+    }
+
+    .nav-links a {
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 0.85rem;
+      font-family: 'Space Mono', monospace;
+      transition: color 0.2s;
+    }
+
+    .nav-links a:hover { color: var(--text); }
+
+    main {
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 4rem 2rem;
+    }
+
+    .hero {
+      margin-bottom: 3rem;
+    }
+
+    .hero h1 {
+      font-size: clamp(2.5rem, 6vw, 4.5rem);
+      font-weight: 800;
+      letter-spacing: -0.04em;
+      line-height: 1;
+      margin-bottom: 1rem;
+    }
+
+    .hero h1 em {
+      font-style: normal;
+      color: var(--accent);
+      position: relative;
+    }
+
+    .hero p {
+      color: var(--muted);
+      font-size: 1rem;
+      max-width: 500px;
+      line-height: 1.6;
+    }
+
+    /* ── MAIN FORM ── */
+    .converter {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 2rem;
+      margin-bottom: 3rem;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .converter::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 2px;
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+    }
+
+    .form-row {
+      display: flex;
+      gap: 0.75rem;
+      margin-bottom: 1rem;
+    }
+
+    input[type="text"], select {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-family: 'Space Mono', monospace;
+      font-size: 0.85rem;
+      padding: 0.75rem 1rem;
+      border-radius: 3px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    input[type="text"] { flex: 1; }
+    input[type="text"]:focus, select:focus { border-color: var(--accent); }
+    select { min-width: 130px; }
+
+    .btn {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      font-family: 'Space Mono', monospace;
+      font-size: 0.85rem;
+      font-weight: 700;
+      padding: 0.75rem 1.5rem;
+      border-radius: 3px;
+      cursor: pointer;
+      letter-spacing: 0.05em;
+      transition: opacity 0.2s, transform 0.1s;
+      white-space: nowrap;
+    }
+
+    .btn:hover { opacity: 0.85; }
+    .btn:active { transform: scale(0.98); }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .btn-ghost {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    .btn-ghost:hover { border-color: var(--text); opacity: 1; }
+
+    /* ── OUTPUT ── */
+    .output-box {
+      display: none;
+      margin-top: 1.5rem;
+      animation: fadeUp 0.3s ease;
+    }
+
+    .output-box.visible { display: block; }
+
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .output-label {
+      font-family: 'Space Mono', monospace;
+      font-size: 0.7rem;
+      color: var(--muted);
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      margin-bottom: 0.5rem;
+    }
+
+    .output-url {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 1rem;
+      font-family: 'Space Mono', monospace;
+      font-size: 0.78rem;
+      color: var(--accent2);
+      word-break: break-all;
+      line-height: 1.6;
+      position: relative;
+    }
+
+    .copy-row {
+      display: flex;
+      gap: 0.5rem;
+      margin-top: 0.75rem;
+    }
+
+    .m3u8-preview {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--accent2);
+      border-radius: 3px;
+      padding: 1rem;
+      font-family: 'Space Mono', monospace;
+      font-size: 0.75rem;
+      color: #888;
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 200px;
+      overflow-y: auto;
+      margin-top: 1rem;
+    }
+
+    .m3u8-preview .kw { color: var(--accent); }
+    .m3u8-preview .url-line { color: var(--accent2); }
+
+    /* ── VIDEO INFO ── */
+    .video-meta {
+      display: none;
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 1rem;
+      margin-bottom: 1rem;
+      gap: 1rem;
+      align-items: center;
+    }
+
+    .video-meta.visible { display: flex; }
+
+    .video-thumb {
+      width: 100px;
+      height: 56px;
+      object-fit: cover;
+      border-radius: 2px;
+      flex-shrink: 0;
+    }
+
+    .video-info-text { flex: 1; min-width: 0; }
+    .video-title {
+      font-weight: 700;
+      font-size: 0.9rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      margin-bottom: 0.25rem;
+    }
+
+    .video-sub {
+      font-family: 'Space Mono', monospace;
+      font-size: 0.7rem;
+      color: var(--muted);
+    }
+
+    /* ── STATUS ── */
+    .status {
+      font-family: 'Space Mono', monospace;
+      font-size: 0.8rem;
+      padding: 0.5rem 0;
+      min-height: 1.5rem;
+    }
+
+    .status.loading { color: var(--accent2); }
+    .status.error { color: #ff453a; }
+    .status.success { color: #30d158; }
+
+    /* ── DOCS SECTION ── */
+    .section-title {
+      font-size: 1.4rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      margin-bottom: 1.5rem;
+      padding-bottom: 0.75rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .endpoint-list {
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+      margin-bottom: 3rem;
+    }
+
+    .endpoint {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      padding: 1.25rem 1.5rem;
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 1rem;
+      align-items: start;
+      cursor: pointer;
+      transition: border-color 0.2s;
+    }
+
+    .endpoint:hover { border-color: #333; }
+
+    .method {
+      font-family: 'Space Mono', monospace;
+      font-size: 0.7rem;
+      font-weight: 700;
+      background: var(--accent);
+      color: #fff;
+      padding: 0.15rem 0.5rem;
+      border-radius: 2px;
+      align-self: center;
+    }
+
+    .ep-path {
+      font-family: 'Space Mono', monospace;
+      font-size: 0.85rem;
+      color: var(--accent2);
+      margin-bottom: 0.25rem;
+    }
+
+    .ep-desc {
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+
+    .ep-params {
+      font-family: 'Space Mono', monospace;
+      font-size: 0.7rem;
+      color: #555;
+    }
+
+    /* ── SPINNER ── */
+    .spinner {
+      display: inline-block;
+      width: 12px; height: 12px;
+      border: 2px solid #333;
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      margin-right: 6px;
+      vertical-align: middle;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── TOAST ── */
+    .toast {
+      position: fixed;
+      bottom: 2rem;
+      right: 2rem;
+      background: #111;
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-family: 'Space Mono', monospace;
+      font-size: 0.8rem;
+      padding: 0.75rem 1.25rem;
+      border-radius: 3px;
+      opacity: 0;
+      transform: translateY(10px);
+      transition: all 0.25s;
+      z-index: 9999;
+    }
+
+    .toast.show { opacity: 1; transform: translateY(0); }
+
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 2rem;
+      text-align: center;
+      font-family: 'Space Mono', monospace;
+      font-size: 0.7rem;
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">YT<span>→</span>M3U8</div>
+  <span class="badge">API v1</span>
+  <nav class="nav-links">
+    <a href="/docs">Swagger</a>
+    <a href="/redoc">ReDoc</a>
+    <a href="#api">API Docs</a>
+  </nav>
+</header>
+
+<main>
+  <div class="hero">
+    <h1>YouTube to<br/><em>M3U8</em> Stream</h1>
+    <p>Extract HLS-compatible stream links from any YouTube video. Works with VLC, mpv, ffmpeg, and any HLS-capable player.</p>
+  </div>
+
+  <div class="converter">
+    <div class="video-meta" id="videoMeta">
+      <img class="video-thumb" id="videoThumb" src="" alt=""/>
+      <div class="video-info-text">
+        <div class="video-title" id="videoTitle">—</div>
+        <div class="video-sub" id="videoSub">—</div>
+      </div>
+    </div>
+
+    <div class="form-row">
+      <input type="text" id="ytUrl" placeholder="https://youtube.com/watch?v=..." />
+      <select id="quality">
+        <option value="best">Best Quality</option>
+        <option value="1080">1080p</option>
+        <option value="720">720p</option>
+        <option value="480">480p</option>
+        <option value="360">360p</option>
+        <option value="worst">Lowest</option>
+      </select>
+      <button class="btn" id="convertBtn" onclick="convert()">Convert</button>
+    </div>
+
+    <div class="status" id="status"></div>
+
+    <div class="output-box" id="outputBox">
+      <div class="output-label">M3U8 Playlist URL</div>
+      <div class="output-url" id="m3u8ApiUrl">—</div>
+      <div class="copy-row">
+        <button class="btn btn-ghost" onclick="copyUrl('m3u8ApiUrl')">Copy Link</button>
+        <button class="btn btn-ghost" onclick="fetchM3U8()">Preview M3U8</button>
+        <button class="btn btn-ghost" onclick="openVLC()">Open in VLC</button>
+      </div>
+      <div class="m3u8-preview" id="m3u8Preview" style="display:none"></div>
+    </div>
+  </div>
+
+  <div id="api">
+    <div class="section-title">API Reference</div>
+
+    <div class="endpoint-list">
+      <div class="endpoint">
+        <span class="method">GET</span>
+        <div>
+          <div class="ep-path">/api/m3u8</div>
+          <div class="ep-desc">Returns an M3U8 playlist for the given YouTube URL. Use this URL directly in any HLS player.</div>
+        </div>
+        <div class="ep-params">?url=&amp;quality=&amp;master=</div>
+      </div>
+
+      <div class="endpoint">
+        <span class="method">GET</span>
+        <div>
+          <div class="ep-path">/api/formats</div>
+          <div class="ep-desc">List all available quality formats for a video without downloading.</div>
+        </div>
+        <div class="ep-params">?url=</div>
+      </div>
+
+      <div class="endpoint">
+        <span class="method">GET</span>
+        <div>
+          <div class="ep-path">/api/stream-url</div>
+          <div class="ep-desc">Get the raw direct stream URL (signed, expires in ~6h). For use with ffmpeg or custom players.</div>
+        </div>
+        <div class="ep-params">?url=&amp;quality=</div>
+      </div>
+
+      <div class="endpoint">
+        <span class="method">GET</span>
+        <div>
+          <div class="ep-path">/api/info</div>
+          <div class="ep-desc">Full video metadata including all format details, thumbnails, view count, etc.</div>
+        </div>
+        <div class="ep-params">?url=</div>
+      </div>
+    </div>
+
+    <!-- Example code blocks -->
+    <div class="section-title" style="margin-top:0">Usage Examples</div>
+
+    <div class="output-label">cURL</div>
+    <div class="m3u8-preview" style="display:block; max-height:none; margin-bottom:1.5rem">
+<span class="kw"># Get M3U8 playlist</span>
+curl "<span class="url-line">https://your-app.onrender.com/api/m3u8?url=https://youtube.com/watch?v=dQw4w9WgXcQ&quality=720</span>"
+
+<span class="kw"># Download with ffmpeg</span>
+ffmpeg -i "<span class="url-line">https://your-app.onrender.com/api/m3u8?url=VIDEO_URL</span>" -c copy output.mp4
+
+<span class="kw"># Play directly with VLC</span>
+vlc "<span class="url-line">https://your-app.onrender.com/api/m3u8?url=VIDEO_URL</span>"
+
+<span class="kw"># With API key (if set)</span>
+curl -H "X-API-Key: your-key" "<span class="url-line">https://your-app.onrender.com/api/m3u8?url=VIDEO_URL</span>"</div>
+
+    <div class="output-label">Python</div>
+    <div class="m3u8-preview" style="display:block; max-height:none; margin-bottom:1.5rem">
+<span class="kw">import</span> requests
+
+BASE = <span class="url-line">"https://your-app.onrender.com"</span>
+VIDEO = <span class="url-line">"https://youtube.com/watch?v=dQw4w9WgXcQ"</span>
+
+<span class="kw"># Get M3U8 content</span>
+r = requests.get(f"{BASE}/api/m3u8", params={"url": VIDEO, "quality": "720"})
+m3u8_content = r.text
+
+<span class="kw"># Get stream URL directly</span>
+r = requests.get(f"{BASE}/api/stream-url", params={"url": VIDEO})
+stream_url = r.json()["url"]
+
+<span class="kw"># List formats</span>
+r = requests.get(f"{BASE}/api/formats", params={"url": VIDEO})
+print(r.json()["available_qualities"])</div>
+
+    <div class="output-label">JavaScript / fetch</div>
+    <div class="m3u8-preview" style="display:block; max-height:none; margin-bottom:3rem">
+<span class="kw">const</span> BASE = <span class="url-line">"https://your-app.onrender.com"</span>;
+<span class="kw">const</span> VIDEO = <span class="url-line">"https://youtube.com/watch?v=dQw4w9WgXcQ"</span>;
+
+<span class="kw">// Get M3U8 URL (just pass this URL to HLS.js or Video.js)</span>
+<span class="kw">const</span> m3u8Url = `${BASE}/api/m3u8?url=${encodeURIComponent(VIDEO)}&quality=720`;
+
+<span class="kw">// Use with HLS.js</span>
+<span class="kw">const</span> hls = <span class="kw">new</span> Hls();
+hls.loadSource(m3u8Url);
+hls.attachMedia(videoElement);</div>
+  </div>
+</main>
+
+<div class="toast" id="toast">Copied!</div>
+
+<footer>YT-M3U8 API · Powered by yt-dlp · <a href="/docs" style="color:inherit">API Docs</a></footer>
+
+<script>
+  const BASE = window.location.origin;
+  let currentVideoUrl = '';
+
+  async function convert() {
+    const url = document.getElementById('ytUrl').value.trim();
+    const quality = document.getElementById('quality').value;
+    if (!url) return;
+
+    currentVideoUrl = url;
+    const btn = document.getElementById('convertBtn');
+    const status = document.getElementById('status');
+    const outputBox = document.getElementById('outputBox');
+    const m3u8Preview = document.getElementById('m3u8Preview');
+
+    btn.disabled = true;
+    outputBox.classList.remove('visible');
+    m3u8Preview.style.display = 'none';
+    status.className = 'status loading';
+    status.innerHTML = '<span class="spinner"></span>Fetching video info...';
+
+    try {
+      // Fetch info first
+      const infoRes = await fetch(`${BASE}/api/info?url=${encodeURIComponent(url)}`);
+      if (!infoRes.ok) {
+        const err = await infoRes.json();
+        throw new Error(err.detail || 'Failed to fetch info');
+      }
+      const info = await infoRes.json();
+
+      // Show video meta
+      const meta = document.getElementById('videoMeta');
+      document.getElementById('videoThumb').src = info.thumbnail || '';
+      document.getElementById('videoTitle').textContent = info.title || 'Unknown';
+      const dur = info.duration ? `${Math.floor(info.duration/60)}:${String(info.duration%60).padStart(2,'0')}` : '?';
+      document.getElementById('videoSub').textContent = `${dur} · ${info.formats_count} formats · ${info.uploader || ''}`;
+      meta.classList.add('visible');
+
+      // Build the API URL
+      const m3u8Url = `${BASE}/api/m3u8?url=${encodeURIComponent(url)}&quality=${quality}`;
+      document.getElementById('m3u8ApiUrl').textContent = m3u8Url;
+
+      outputBox.classList.add('visible');
+      status.className = 'status success';
+      status.textContent = '✓ Ready — use the URL below in any HLS player';
+    } catch (e) {
+      status.className = 'status error';
+      status.textContent = '✗ ' + (e.message || 'Unknown error');
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function fetchM3U8() {
+    const url = document.getElementById('m3u8ApiUrl').textContent;
+    const preview = document.getElementById('m3u8Preview');
+    preview.style.display = 'block';
+    preview.textContent = 'Loading...';
+
+    try {
+      const res = await fetch(url);
+      const text = await res.text();
+
+      // Syntax highlight
+      const highlighted = text
+        .split('\n')
+        .map(line => {
+          if (line.startsWith('#')) return `<span class="kw">${escapeHtml(line)}</span>`;
+          if (line.startsWith('http')) return `<span class="url-line">${escapeHtml(line.substring(0, 80))}...</span>`;
+          return escapeHtml(line);
+        })
+        .join('\n');
+
+      preview.innerHTML = highlighted;
+    } catch (e) {
+      preview.textContent = 'Error: ' + e.message;
+    }
+  }
+
+  function escapeHtml(t) {
+    return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  function copyUrl(id) {
+    const text = document.getElementById(id).textContent;
+    navigator.clipboard.writeText(text).then(() => showToast('Copied!'));
+  }
+
+  function openVLC() {
+    const url = document.getElementById('m3u8ApiUrl').textContent;
+    window.location.href = `vlc://${url.replace(/^https?:\/\//, '')}`;
+  }
+
+  function showToast(msg) {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.classList.add('show');
+    setTimeout(() => t.classList.remove('show'), 2000);
+  }
+
+  document.getElementById('ytUrl').addEventListener('keydown', e => {
+    if (e.key === 'Enter') convert();
+  });
+</script>
+</body>
+</html>
