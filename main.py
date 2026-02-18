@@ -221,13 +221,18 @@ async def proxy_endpoint(request: Request, url: str = Query(...)):
         raise HTTPException(403, f"Proxy not allowed for: {host}")
 
     # Detect if this is an M3U8 (manifest/playlist)
-    path_part = urlparse(target).path.lower()
-    is_m3u8 = (
-        path_part.endswith(".m3u8")
-        or "/hls_playlist/" in target
-        or "/hls_manifest/" in target
-        or "playlist/index.m3u8" in target
-        or "/manifest/" in target
+    # CRITICAL: seg.ts URLs contain "index.m3u8" mid-path, e.g.:
+    #   /videoplayback/.../playlist/index.m3u8/sq/6781535/.../seg.ts  <- TS segment!
+    # So we must check the FINAL path component, not substring match.
+    parsed_target = urlparse(target)
+    path_lower = parsed_target.path.lower()
+    # "/sq/" in path = numbered segment chunk, never a manifest
+    is_segment = "/sq/" in path_lower or path_lower.endswith(".ts") or path_lower.endswith(".aac") or path_lower.endswith(".m4s")
+    is_m3u8 = not is_segment and (
+        path_lower.endswith(".m3u8")
+        or (path_lower.endswith("index.m3u8"))
+        or ("/hls_playlist/" in path_lower and not is_segment)
+        or ("/hls_manifest/" in path_lower and not is_segment)
     )
 
     if is_m3u8:
@@ -245,24 +250,29 @@ async def proxy_endpoint(request: Request, url: str = Query(...)):
         )
 
     # Binary segment — stream directly with httpx using YouTube headers
+    # Infer content-type from URL without doing a HEAD request (saves latency, avoids 403s)
+    path_end = path_lower.split("?")[0]
+    if path_end.endswith(".ts") or "/seg.ts" in path_lower or "/sq/" in path_lower:
+        ct = "video/mp2t"
+    elif path_end.endswith(".m4s") or path_end.endswith(".mp4"):
+        ct = "video/mp4"
+    elif path_end.endswith(".aac"):
+        ct = "audio/aac"
+    else:
+        ct = "application/octet-stream"
+
     async def stream_segment():
         async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
             async with client.stream("GET", target, headers=YT_HEADERS) as r:
+                if r.status_code >= 400:
+                    raise HTTPException(r.status_code, f"Upstream error: {r.status_code}")
                 async for chunk in r.aiter_bytes(65536):
                     yield chunk
-
-    # Peek at content-type
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=10) as client:
-            head = await client.head(target, headers=YT_HEADERS)
-            ct = head.headers.get("content-type", "video/mp2t")
-    except Exception:
-        ct = "video/mp2t"
 
     return StreamingResponse(
         stream_segment(),
         media_type=ct,
-        headers={"Cache-Control": "public, max-age=3600", "Access-Control-Allow-Origin": "*"},
+        headers={"Cache-Control": "public, max-age=300", "Access-Control-Allow-Origin": "*"},
     )
 
 
