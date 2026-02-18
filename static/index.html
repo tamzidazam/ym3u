@@ -447,6 +447,40 @@
     </div>
   </div>
 
+  <!-- COOKIE PANEL -->
+  <div class="converter" id="cookiePanel" style="margin-bottom:2rem">
+    <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:1rem">
+      <span id="cookieDot" style="width:10px;height:10px;border-radius:50%;background:#555;flex-shrink:0"></span>
+      <strong style="font-size:0.95rem">Cookie Authentication</strong>
+      <span id="cookieStatus" style="font-family:'Space Mono',monospace;font-size:0.72rem;color:var(--muted);margin-left:auto"></span>
+    </div>
+    <p style="font-size:0.82rem;color:var(--muted);margin-bottom:1rem;line-height:1.6">
+      If you get a <code style="background:var(--code-bg);padding:0.1rem 0.4rem;border-radius:2px;color:var(--accent)">Sign in to confirm you're not a bot</code> error,
+      upload your browser cookies below. Export using the
+      <strong style="color:var(--text)">"Get cookies.txt LOCALLY"</strong> Chrome extension while logged into YouTube.
+    </p>
+    <div class="form-row" style="align-items:center">
+      <label style="
+        flex:1;
+        background:var(--code-bg);
+        border:1px dashed var(--border);
+        border-radius:3px;
+        padding:0.7rem 1rem;
+        font-family:'Space Mono',monospace;
+        font-size:0.8rem;
+        color:var(--muted);
+        cursor:pointer;
+        transition:border-color 0.2s;
+      " id="cookieLabel" ondragover="event.preventDefault()" ondrop="handleCookieDrop(event)">
+        <input type="file" id="cookieFile" accept=".txt" style="display:none" onchange="cookieFileSelected()"/>
+        <span id="cookieFileName">📂 Click to select cookies.txt — or drag & drop</span>
+      </label>
+      <button class="btn" id="uploadBtn" onclick="uploadCookies()" disabled>Upload</button>
+      <button class="btn btn-ghost" onclick="deleteCookies()" title="Remove saved cookies">✕ Clear</button>
+    </div>
+    <div class="status" id="cookieMsg"></div>
+  </div>
+
   <div id="api">
     <div class="section-title">API Reference</div>
 
@@ -649,3 +683,72 @@ hls.attachMedia(videoElement);</div>
 </script>
 </body>
 </html>
+<script>
+  // ── Cookie management ───────────────────────────────────────────────────────
+  async function checkCookieStatus() {
+    try {
+      const r = await fetch(`${BASE}/api/cookies/status`);
+      const data = await r.json();
+      const dot = document.getElementById('cookieDot');
+      const status = document.getElementById('cookieStatus');
+      if (data.cookies_loaded) {
+        dot.style.background = '#30d158';
+        status.textContent = `✓ ${data.entries} cookies loaded`;
+        status.style.color = '#30d158';
+      } else {
+        dot.style.background = '#ff9f0a';
+        status.textContent = 'No cookies — bot-protected videos may fail';
+        status.style.color = '#ff9f0a';
+      }
+    } catch(e) {}
+  }
+  checkCookieStatus();
+  let selectedCookieFile = null;
+  function cookieFileSelected() {
+    const input = document.getElementById('cookieFile');
+    if (input.files[0]) {
+      selectedCookieFile = input.files[0];
+      document.getElementById('cookieFileName').textContent = '📄 ' + input.files[0].name;
+      document.getElementById('uploadBtn').disabled = false;
+    }
+  }
+  function handleCookieDrop(e) {
+    e.preventDefault();
+    const file = e.dataTransfer.files[0];
+    if (file) {
+      selectedCookieFile = file;
+      document.getElementById('cookieFileName').textContent = '📄 ' + file.name;
+      document.getElementById('uploadBtn').disabled = false;
+    }
+  }
+  async function uploadCookies() {
+    if (!selectedCookieFile) return;
+    const msg = document.getElementById('cookieMsg');
+    const btn = document.getElementById('uploadBtn');
+    btn.disabled = true;
+    msg.className = 'status loading';
+    msg.innerHTML = '<span class="spinner"></span>Uploading cookies...';
+    const fd = new FormData();
+    fd.append('file', selectedCookieFile);
+    try {
+      const r = await fetch(`${BASE}/api/cookies`, { method: 'POST', body: fd });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.detail || 'Upload failed');
+      msg.className = 'status success';
+      msg.textContent = '✓ Saved — ' + data.entries + ' cookies loaded';
+      checkCookieStatus();
+    } catch(e) {
+      msg.className = 'status error';
+      msg.textContent = '✗ ' + e.message;
+    } finally { btn.disabled = false; }
+  }
+  async function deleteCookies() {
+    await fetch(`${BASE}/api/cookies`, { method: 'DELETE' });
+    const msg = document.getElementById('cookieMsg');
+    msg.className = 'status'; msg.textContent = 'Cookies cleared.';
+    document.getElementById('cookieFileName').textContent = '📂 Click to select cookies.txt — or drag & drop';
+    document.getElementById('uploadBtn').disabled = true;
+    selectedCookieFile = null;
+    checkCookieStatus();
+  }
+</script>
