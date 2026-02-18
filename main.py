@@ -262,21 +262,22 @@ async def proxy_endpoint(request: Request, url: str = Query(...)):
         ct = "application/octet-stream"
 
     def fetch_segment_bytes(url: str) -> bytes:
-        """Fetch a segment synchronously via yt-dlp urlopen (handles auth)."""
+        """Fetch a segment synchronously via yt-dlp urlopen (handles IP-signed auth)."""
         with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
             resp = ydl.urlopen(url)
             return resp.read()
 
-    async def stream_segment():
-        loop = asyncio.get_event_loop()
-        try:
-            data = await loop.run_in_executor(None, fetch_segment_bytes, target)
-        except Exception as e:
-            raise HTTPException(502, f"Segment fetch failed: {e}")
-        yield data
+    # Run synchronously in thread pool, then return as plain Response (not streaming).
+    # StreamingResponse + async generator + run_in_executor causes empty body — the
+    # generator exits before the executor resolves. Plain Response with bytes is reliable.
+    loop = asyncio.get_event_loop()
+    try:
+        data = await loop.run_in_executor(None, fetch_segment_bytes, target)
+    except Exception as e:
+        raise HTTPException(502, f"Segment fetch failed: {e}")
 
-    return StreamingResponse(
-        stream_segment(),
+    return Response(
+        content=data,
         media_type=ct,
         headers={"Cache-Control": "public, max-age=300", "Access-Control-Allow-Origin": "*"},
     )
