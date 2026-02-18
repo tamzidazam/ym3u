@@ -11,7 +11,9 @@ app = FastAPI(title="YT-M3U8 API", description="Convert YouTube videos to M3U8 H
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 API_KEY     = os.environ.get("API_KEY", "")
-COOKIES_DIR = Path(os.environ.get("COOKIES_DIR", "/app"))
+# Use a local writable directory — /app doesn't exist on Render free tier
+_default_cookies_dir = Path(__file__).parent / "data"
+COOKIES_DIR = Path(os.environ.get("COOKIES_DIR", str(_default_cookies_dir)))
 COOKIES_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -21,6 +23,7 @@ def find_cookies() -> str | None:
         str(COOKIES_DIR / "cookies.txt"),
         os.environ.get("COOKIES_FILE", ""),
         "./cookies.txt",
+        "./data/cookies.txt",
     ]
     for p in candidates:
         if p and Path(p).exists() and Path(p).stat().st_size > 0:
