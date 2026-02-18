@@ -249,8 +249,8 @@ async def proxy_endpoint(request: Request, url: str = Query(...)):
             headers={"Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*"},
         )
 
-    # Binary segment — stream directly with httpx using YouTube headers
-    # Infer content-type from URL without doing a HEAD request (saves latency, avoids 403s)
+    # Binary segment — fetch via yt-dlp opener (handles IP-signed URLs correctly)
+    # httpx gets 403 because Google segments are IP+session signed; yt-dlp sends the right tokens
     path_end = path_lower.split("?")[0]
     if path_end.endswith(".ts") or "/seg.ts" in path_lower or "/sq/" in path_lower:
         ct = "video/mp2t"
@@ -261,13 +261,19 @@ async def proxy_endpoint(request: Request, url: str = Query(...)):
     else:
         ct = "application/octet-stream"
 
+    def fetch_segment_bytes(url: str) -> bytes:
+        """Fetch a segment synchronously via yt-dlp urlopen (handles auth)."""
+        with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
+            resp = ydl.urlopen(url)
+            return resp.read()
+
     async def stream_segment():
-        async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
-            async with client.stream("GET", target, headers=YT_HEADERS) as r:
-                if r.status_code >= 400:
-                    raise HTTPException(r.status_code, f"Upstream error: {r.status_code}")
-                async for chunk in r.aiter_bytes(65536):
-                    yield chunk
+        loop = asyncio.get_event_loop()
+        try:
+            data = await loop.run_in_executor(None, fetch_segment_bytes, target)
+        except Exception as e:
+            raise HTTPException(502, f"Segment fetch failed: {e}")
+        yield data
 
     return StreamingResponse(
         stream_segment(),
